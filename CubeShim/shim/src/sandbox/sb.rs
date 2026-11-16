@@ -55,12 +55,31 @@ const ANNO_ENABLE_IVSHMEM: &str = "cube.master.enable_ivshmem";
 const IVSHMEM_DEFAULT_SIZE: usize = 1 * 1024 * 1024; // 1MB
 
 // 恢复握手分开限制单次等待与整体预算，避免第一次连接占满全部重试时间。
-const RECONNECT_ATTEMPTS: u32 = 5;
+// Enough attempts that RESTORE_RECONNECT_DEADLINE, not the count, ends a
+// restore that keeps timing out: 30 s / (2 s + 0.1 s) is about 14.
+const RECONNECT_ATTEMPTS: u32 = 15;
 const RECONNECT_BACKOFF_MS: u64 = 100;
 const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 // 包含连接、reset RPC（Remote Procedure Call，远程过程调用）和重试间隔；
 // 最后一次尝试只能使用剩余时间，不额外延长恢复预算。
+/// Overall deadline for the cold-boot connect (a single attempt).
 const RECONNECT_DEADLINE: Duration = Duration::from_secs(10);
+/// Overall deadline for the restore retry loop. With a 10 s deadline a
+/// restored guest whose first page faults stall on the memory image's
+/// backing storage (e.g. a JuiceFS FUSE mount busy for ~10 s) failed
+/// outright. 30 s lets such a guest keep retrying RECONNECT_CONNECT_TIMEOUT
+/// handshakes through the stall; a dead agent now fails after 30 s instead
+/// of 10 s.
+const RESTORE_RECONNECT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Overall agent (re)connect deadline for a restore or a cold boot.
+fn reconnect_deadline(restore: bool) -> Duration {
+    if restore {
+        RESTORE_RECONNECT_DEADLINE
+    } else {
+        RECONNECT_DEADLINE
+    }
+}
 
 /// How often the snapshot recovery task re-checks the lease and retries a
 /// release that failed.
@@ -313,8 +332,8 @@ impl SandBox {
     /// transient surfaces both at the connect handshake and at the first
     /// RPC. What follows the first RPC is not retried: it is not idempotent,
     /// and reset_guest passing is the signal that the guest can serve again.
-    /// A restored guest whose agent is dead pays the full 10 s deadline
-    /// before the create or resume fails.
+    /// A restored guest whose agent is dead pays the full restore deadline
+    /// (RESTORE_RECONNECT_DEADLINE) before the create or resume fails.
     async fn connect_agent_with_retry(&mut self, restore: bool) -> CResult<()> {
         // One stat for the whole sequence: a failed attempt that a later one
         // supersedes must not record an Err.
@@ -362,7 +381,8 @@ impl SandBox {
                 }
             }
         };
-        let res = match tokio::time::timeout(RECONNECT_DEADLINE, retry).await {
+        let deadline = reconnect_deadline(restore);
+        let res = match tokio::time::timeout(deadline, retry).await {
             Ok(res) => res,
             Err(_) => Err(format!(
                 "agent reconnect exceeded the deadline after {} attempts (last failure: {})",
@@ -2183,6 +2203,32 @@ fn normalize_dns_for_agent(entry: &str) -> CResult<String> {
         .parse::<IpAddr>()
         .map_err(|_| format!("invalid dns ip {}", entry))?;
     Ok(format!("nameserver {}", ip))
+}
+
+#[cfg(test)]
+mod reconnect_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn restore_deadline_allows_several_handshakes() {
+        // A handshake can park for AGENT_CONNECT_TIMEOUT; the restore loop
+        // must outlive more than one of them or it never retries a stall.
+        assert!(reconnect_deadline(true) >= AsyncUtils::AGENT_CONNECT_TIMEOUT * 3);
+        assert_eq!(reconnect_deadline(true), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn cold_boot_deadline_unchanged() {
+        assert_eq!(reconnect_deadline(false), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn restore_attempts_outlast_the_deadline() {
+        // Handshakes that keep timing out must be stopped by the restore
+        // deadline, not by the attempt count.
+        let per_attempt = RECONNECT_CONNECT_TIMEOUT + Duration::from_millis(RECONNECT_BACKOFF_MS);
+        assert!(per_attempt * RECONNECT_ATTEMPTS > reconnect_deadline(true));
+    }
 }
 
 #[cfg(test)]
