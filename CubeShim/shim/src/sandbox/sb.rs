@@ -2256,6 +2256,7 @@ mod tests {
         freeze_rpc_context, SnapshotFreezeState, SnapshotHold, SnapshotMode,
         ERR_FREEZE_UNSUPPORTED, ERR_ROOTFS_UNSUPPORTED, FREEZE_CALL_BACKSTOP, FREEZE_RPC_TIMEOUT,
     };
+    use super::{RECONNECT_ATTEMPTS, RESTORE_RECONNECT_DEADLINE};
     use cube_hypervisor::SnapshotType;
 
     // 通过真实 Unix socket 模拟 vsock 握手；后端使用真实 ttRPC 服务，覆盖连接和 reset。
@@ -2442,7 +2443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_budget_caps_all_stalled_connections_at_ten_seconds() {
+    async fn reconnect_budget_caps_all_stalled_connections_at_the_restore_deadline() {
         let (mut f, mut sb) = ReconnectFixture::new(usize::MAX, false).await;
         let start = std::time::Instant::now();
         let result = sb.connect_agent_with_retry(true).await;
@@ -2450,21 +2451,27 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("agent reconnect exceeded the deadline"));
-        assert!(elapsed >= std::time::Duration::from_secs(9));
-        assert!(elapsed < std::time::Duration::from_secs(12));
-        // The fifth attempt starts about 8.4 s in, so a slow timer wake-up on
-        // a loaded runner can let the deadline fire first. Four attempts are
-        // what a 10 s budget guarantees; the deadline is the property here.
-        assert!(f.attempts() >= 4, "only {} attempts", f.attempts());
+        assert!(elapsed >= RESTORE_RECONNECT_DEADLINE - std::time::Duration::from_secs(1));
+        assert!(elapsed < RESTORE_RECONNECT_DEADLINE + std::time::Duration::from_secs(2));
+        // Stalled handshakes take RECONNECT_CONNECT_TIMEOUT plus the backoff
+        // each, so the last attempt starts about 0.6 s before the deadline and
+        // a slow timer wake-up on a loaded runner can let the deadline fire
+        // first. One attempt fewer than the limit is what the deadline
+        // guarantees; the deadline, not the count, is the property here.
+        assert!(
+            f.attempts() >= RECONNECT_ATTEMPTS as usize - 1,
+            "only {} attempts",
+            f.attempts()
+        );
         f.stop().await;
     }
 
     #[tokio::test]
-    async fn reconnect_budget_caps_fast_failures_at_five_attempts() {
+    async fn reconnect_budget_caps_fast_failures_at_the_attempt_limit() {
         let (mut f, mut sb) = ReconnectFixture::new(0, true).await;
         let result = sb.connect_agent_with_retry(true).await;
         assert!(result.unwrap_err().contains("Connect failed rsp"));
-        assert_eq!(f.attempts(), 5);
+        assert_eq!(f.attempts(), RECONNECT_ATTEMPTS as usize);
         assert_eq!(f.resets.load(std::sync::atomic::Ordering::SeqCst), 0);
         f.stop().await;
     }
@@ -2491,8 +2498,8 @@ mod tests {
     #[tokio::test]
     async fn reconnect_budget_deadline_includes_a_hung_reset_rpc() {
         let (mut f, mut sb) = ReconnectFixture::new_with_reset_hang(0, false, true).await;
-        // 将 RPC 自身超时设得更长，确认真正生效的是整体重连预算。
-        sb.ctx.timeout_nano = 20_000_000_000;
+        // 将 RPC 自身超时设得比恢复预算更长，确认真正生效的是整体重连预算。
+        sb.ctx.timeout_nano = (RESTORE_RECONNECT_DEADLINE * 2).as_nanos() as i64;
         let reset_started = f.reset_started.take().unwrap();
         let start = std::time::Instant::now();
         let retry = tokio::spawn(async move { sb.connect_agent_with_retry(true).await });
@@ -2507,8 +2514,8 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("agent reconnect exceeded the deadline"));
-        assert!(elapsed >= std::time::Duration::from_secs(9));
-        assert!(elapsed < std::time::Duration::from_secs(11));
+        assert!(elapsed >= RESTORE_RECONNECT_DEADLINE - std::time::Duration::from_secs(1));
+        assert!(elapsed < RESTORE_RECONNECT_DEADLINE + std::time::Duration::from_secs(1));
         assert_eq!(
             f.attempts(),
             1,
