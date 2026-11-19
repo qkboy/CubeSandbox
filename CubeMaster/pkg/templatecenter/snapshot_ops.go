@@ -150,6 +150,7 @@ func SubmitSandboxSnapshot(ctx context.Context, requestID, sandboxID, hostID, ho
 	if err != nil {
 		return nil, err
 	}
+	normalizedBackend = constants.SnapshotCommitBackend(normalizedBackend)
 	if client := strings.TrimSpace(backend); client != "" && !strings.EqualFold(client, normalizedBackend) {
 		log.G(ctx).Infof("snapshot create ignores client backend=%s; using persisted backend=%s sandbox=%s", client, normalizedBackend, sandboxID)
 	}
